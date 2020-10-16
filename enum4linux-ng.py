@@ -979,22 +979,46 @@ class EnumOsInfo():
 
     def run(self):
         '''
-        Run module srvinfo which collects various OS information.
+        Run module OS info which tries to collect OS information. The supports both authenticated and unauthenticated
+        enumeration. This allows to get some target information without having a working session for many systems.
         '''
         module_name = ENUM_OS_INFO
         print_heading(f"OS Information via RPC on {self.target.host}")
         output = {"os_info":None}
+        os_info = {"os":None, "os_version":None, "os_build": None, "platform_id":None, "server_lanman": None, "server_type":None, "server_type_string":None}
 
-        srvinfo = self.srvinfo()
-        if srvinfo.retval:
-            osinfo = self.get_os_info(srvinfo.retval)
-            if osinfo.retval:
-                print_success(osinfo.retmsg)
-                output["os_info"] = osinfo.retval
+        # Even an unauthenticated SMB session gives OS information about the target system, collect these first
+        for port in self.target.smb_ports:
+            self.target.port = port
+            print_info(f"Enumerating via unauthenticated SMB session on {port}/tcp")
+            result_smb = self.enum_from_smb()
+            if result_smb.retval:
+                print_success(result_smb.retmsg)
+                break
+            output = process_error(result_smb.retmsg, ["os_info"], module_name, output)
+
+        if result_smb.retval:
+            os_info = {**os_info, **result_smb.retval}
+
+        # If the earlier checks for RPC users sessions succeeded, we can continue by enumerating info via rpcclient's srvinfo
+        print_info("Enumerating via 'srvinfo'")
+        if self.target.sessions:
+            result_srvinfo = self.enum_from_srvinfo()
+            if result_srvinfo.retval:
+                print_success(result_srvinfo.retmsg)
             else:
-                output = process_error(osinfo.retmsg, ["os_info"], module_name, output)
+                output = process_error(result_srvinfo.retmsg, ["os_info"], module_name, output)
+
+            if result_srvinfo.retval is not None:
+                os_info = {**os_info, **result_srvinfo.retval}
         else:
-            output = process_error(srvinfo.retmsg, ["os_info"], module_name, output)
+            output = process_error("Skipping 'srvinfo' run, null or user session required", ["os_info"], module_name, output)
+
+        # Take all collected information and generate os_info entry
+        if result_smb.retval or (self.target.sessions and result_srvinfo.retval):
+            os_info = self.os_info_to_human(os_info)
+            print_success(f"After merging OS information we have the following result:\n{yamlize(os_info)}")
+            output["os_info"] = os_info
 
         return output
 
@@ -1006,64 +1030,129 @@ class EnumOsInfo():
         '''
 
         command = ["rpcclient", "-W", self.target.workgroup, '-U', f'{self.creds.user}%{self.creds.pw}', '-c', 'srvinfo', self.target.host]
-        result = run(command, "Attempting to get OS info with command", self.target.samba_config, timeout=self.target.timeout)
+        result = run(command, "Attempting to get OS info with command", self.target.samba_config)
 
         if not result.retval:
             return Result(None, f"Could not get OS info via 'srvinfo': {result.retmsg}")
 
         return Result(result.retmsg, "")
 
-    # FIXME: Evaluate server_type_string
-    def get_os_info(self, srvinfo_result):
+    def enum_from_srvinfo(self):
         '''
-        Takes the result of rpcclient's srvinfo command and tries to extract information like
-        platform_id, os version and server type.
+        Parses the output of rpcclient's srvinfo command and extracts the various information.
         '''
-        search_pattern_list = ["platform_id", "os version", "server type"]
+        result = self.srvinfo()
 
-        os_info = {}
+        if result.retval is None:
+            return result
+
+        os_info = {"os_version":None, "server_type":None, "server_type_string":None, "platform_id":None}
+        search_pattern_list = ["platform_id", "os version", "server type"]
         first = True
-        for line in srvinfo_result.splitlines():
+        for line in result.retval.splitlines():
+
             if first:
                 match = re.search(r"\s+[^\s]+\s+(.*)", line)
                 if match:
-                    os_info['server_type_string'] = match.group(1)
+                    os_info['server_type_string'] = match.group(1).rstrip()
                 first = False
+
             for search_pattern in search_pattern_list:
                 match = re.search(fr"\s+{search_pattern}\s+:\s+(.*)", line)
                 if match:
-                    # os version => os_version, server type => server_type
-                    search_pattern = search_pattern.replace(" ", "_")
-                    os_info[search_pattern] = match.group(1)
+                    key = search_pattern.replace(" ", "_")
+                    os_info[key] = match.group(1)
+
         if not os_info:
-            return Result(None, "Could not get OS information")
+            return Result(None, "Could not parse result of 'srvinfo' command, please open a GitHub issue")
+        return Result(os_info, "Found OS information via 'srvinfo'")
 
-        if "os_version" in os_info and "server_type_string" in os_info:
-            os_info["os"] = self.os_info_to_human(os_info)
+    def enum_from_smb(self):
+        '''
+        Tries to set up an SMB null session. Even if the null session does not succeed, the SMB protocol will transfer
+        some information about the remote system in the SMB "Session Setup Response" or the SMB "Session Setup andX Response"
+        packet. This is the major and minor OS version as well as the build number. In SMBv1 also the "Native OS" as well as
+        the "Native LAN Manager" will be reported.
+        '''
+        os_info = {"os_version":None, "os_build":None, "server_lanman":None}
 
-        retmsg = "The following OS information were found:\n"
-        for key, value in os_info.items():
-            retmsg += (f"{key:18} = {value}\n")
-        retmsg = retmsg.rstrip()
-        return Result(os_info, retmsg)
+        smb_conn = None
+        try:
+            smb_conn = smbconnection.SMBConnection(remoteName=self.target.host, remoteHost=self.target.host, sess_port=self.target.port, timeout=self.target.timeout)
+            smb_conn.login("", "", "")
+        except Exception as e:
+            if len(e.args) == 2:
+                if isinstance(e.args[1], ConnectionRefusedError):
+                    return Result(None, f"SMB connection error on port {self.target.port}/tcp: Connection refused")
+                if isinstance(e.args[1], socket.timeout):
+                    return Result(None, f"SMB connection error on port {self.target.port}/tcp: timed out")
+            if isinstance(e, nmb.NetBIOSError):
+                return Result(None, f"SMB connection error on port {self.target.port}/tcp: session failed")
+            if isinstance(e, (smb.SessionError, smb3.SessionError)):
+                return Result(None, f"SMB connection error on port {self.target.port}/tcp: session failed")
+            if not smb_conn:
+                return Result(None, f"SMB connection error on port {self.target.port}/tcp: session failed")
+
+        # OS Major and Minor are part of the SMB2 Session Setup Response packet (not part of SMBv1)
+        try:
+            os_major = smb_conn.getServerOSMajor()
+            os_minor = smb_conn.getServerOSMinor()
+            if os_major and os_minor:
+                os_info["os_version"] = f"{os_major}.{os_minor}"
+            else:
+                os_info["os_version"] = "not supported"
+        except:
+            pass
+
+        # OS Build is only part of the SMB2 Session Setup Response packet (not part of SMBv1)
+        try:
+            os_build = smb_conn.getServerOSBuild()
+            if os_build:
+                os_info["os_build"] = f"{os_build}"
+            else:
+                os_info["os_build"] = "not supported"
+        except:
+            pass
+
+        # Native LAN Manager/Server LAN Manager is only part of the Session Setup AndX Response
+        # packet in SMBv1
+        try:
+            server_lanman = smb_conn.getSMBServer().get_server_lanman()
+            if server_lanman:
+                os_info["server_lanman"] = f"{server_lanman}"
+        except AttributeError:
+            os_info["server_lanman"] = "not supported"
+        except:
+            pass
+
+        if not any(os_info.values()):
+            return Result(None, "Could not enumerate information via unauthenticated SMB")
+        return Result(os_info, "Found OS information via SMB")
 
     def os_info_to_human(self, os_info):
+        server_lanman = os_info["server_lanman"]
+        version = os_info["os_version"]
         server_type_string = os_info["server_type_string"]
-        os_version = os_info["os_version"]
+        os = "unknown"
 
-        if "Samba" in server_type_string:
+        if server_lanman is not None and "Samba" in server_lanman:
+            os = f"Linux/Unix ({server_lanman})"
+        elif server_type_string is not None and "Samba" in server_type_string:
             # Examples:
             # Wk Sv ... Samba 4.8.0-Debian
             # Wk Sv ... (Samba 3.0.0)
             match = re.search(r".*(Samba\s.*[^)])", server_type_string)
             if match:
-                return  f"Linux/Unix ({match.group(1)})"
-            return  "Linux/Unix"
+                os = f"Linux/Unix ({match.group(1)})"
+            else:
+                os = "Linux/Unix"
+        elif version in OS_VERSIONS:
+            os = OS_VERSIONS[version]
 
-        if os_version in OS_VERSIONS:
-            return OS_VERSIONS[os_version]
+        os_info["os"] = os
 
-        return "unknown"
+        return os_info
+
 
 ### Users Enumeration via RPC
 
@@ -2163,10 +2252,14 @@ class Enumerator():
             modules.append(ENUM_SMB)
             modules.append(ENUM_SESSIONS)
 
+            # The OS info module supports both session-less (unauthenticated) and session-based (authenticated)
+            # enumeration. Therefore, we can run it even if no sessions were possible...
+            if self.args.O:
+                modules.append(ENUM_OS_INFO)
+
+            # ...the remaining modules still need a working session.
             if sessions:
                 modules.append(ENUM_LSAQUERY_DOMAIN_INFO)
-                if self.args.O:
-                    modules.append(ENUM_OS_INFO)
                 if self.args.U:
                     modules.append(ENUM_USERS_RPC)
                 if self.args.G:
@@ -2215,8 +2308,7 @@ class Enumerator():
             self.target.sessions = self.output.as_dict()['sessions_possible']
 
         # If sessions are not possible, we regenerate the list of modules again.
-        # This will only leave those modules in, which don't require authentication
-        # (none at the moment, therefore the tool would finish enumeration).
+        # This will only leave those modules in, which don't require authentication.
         if not self.target.sessions:
             modules = self.get_modules(self.target.services, self.target.sessions)
 
