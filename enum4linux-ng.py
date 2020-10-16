@@ -1030,7 +1030,7 @@ class EnumOsInfo():
         '''
 
         command = ["rpcclient", "-W", self.target.workgroup, '-U', f'{self.creds.user}%{self.creds.pw}', '-c', 'srvinfo', self.target.host]
-        result = run(command, "Attempting to get OS info with command", self.target.samba_config)
+        result = run(command, "Attempting to get OS info with command", self.target.samba_config, timeout=self.target.timeout)
 
         if not result.retval:
             return Result(None, f"Could not get OS info via 'srvinfo': {result.retmsg}")
